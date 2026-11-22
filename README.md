@@ -37,7 +37,7 @@ For Studio automation, set Resolve > Preferences > System > General > **External
 ## Transfers (0.10)
 - **Compare with destination** (Options menu on the Copy page): *Copy everything*, *Continue — skip files already copied*, or *Only files missing at the destination*. The review screen then shows how many files already exist with the same size, how many differ, and how many bytes will actually move.
 - **Continue** on an interrupted or failed job resumes where it stopped; finished files are never recopied.
-- Several transfers run at once (default 3, Settings → "Transfers at once", up to 6). Two jobs never write to the same destination drive simultaneously. The menu bar shows `2× 45%` while several run; the queue badge counts them.
+- **Several transfers run at once** (default 4, Settings → "Transfers at once", up to 6), including jobs writing to the same destination drive — only jobs whose output folders overlap are refused. Inside each job, **up to 4 files copy in parallel** (each with its own read-ahead, hash and write stream), so one big folder no longer trickles file by file. The menu bar shows `2× 45%` while several run; the queue badge counts them.
 - The panel closes when you click outside it even mid-copy — the copy keeps going (Finder-like).
 - Big-file hardening: per-file autorelease pools, throttled UI updates, content hashing skipped when file sizes already differ, `F_FULLFSYNC` only for files ≥128 MB (plain `fsync` otherwise, several seconds faster per small file on external drives).
 - **Video preview in the browser**: play button on the selected row, right-click → Preview, or Enter — inline player for video/audio, image viewer for photos.

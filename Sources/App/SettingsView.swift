@@ -58,7 +58,7 @@ struct SettingsView: View {
                         }
                     }
                 }
-                Stepper("Transfers at once: \(model.settings.maxConcurrent ?? 3)", value: Binding(get: { model.settings.maxConcurrent ?? 3 }, set: { model.settings.maxConcurrent = $0; model.pump() }), in: 1...6)
+                Stepper("Transfers at once: \(model.settings.maxConcurrent ?? 4)", value: Binding(get: { model.settings.maxConcurrent ?? 4 }, set: { model.settings.maxConcurrent = $0; model.pump() }), in: 1...6)
                 HStack {
                     LabeledContent("DaVinci Resolve app", value: model.settings.resolveAppPath ?? ResolveAdapter.appPath)
                     Button("Choose…") { model.chooseResolveApp() }

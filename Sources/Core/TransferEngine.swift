@@ -400,30 +400,76 @@ final class TransferRunner {
         job.copiedBytes = items.filter { $0.state.isDone }.reduce(0) { $0 + $1.bytes }
         job.doneFiles = items.filter { $0.state.isDone }.count
         var stopReason: String?
+        // Parallel streams: up to four files of this job move at once (each with its own
+        // read-ahead, hash and write). Shared state — items, counters, stop flags, the
+        // progress call — lives behind `lock`, so every closure below sees consistent data.
+        let lock = NSLock()
+        var nextIdx = 0
+        var stopAll = false
         var lastProgress = Date.distantPast
-        for idx in items.indices where !items[idx].state.isDone {
-            if isCancelled() { job.status = .paused; break }
-            // Per-file autorelease pool: chunk buffers from thousands of files must not pile up.
-            var doneState: ItemState = .pending
-            autoreleasepool {
-                var item = items[idx]
-                item.state = .copying
-                item = copy(item, srcRoot: srcRoot, outRoot: outRoot, policy: item.policy ?? job.conflictPolicy, sizeOnly: job.verification == .sizeOnly, job: &job, isCancelled: isCancelled, activity: activity)
-                items[idx] = item
-                doneState = item.state
-                try? db.save("titem", id: job.id.uuidString + "|" + item.relativePath, parent: job.id.uuidString, item)
-                if item.state.isDone { job.copiedBytes += item.bytes; job.doneFiles = (job.doneFiles ?? 0) + 1 }
-            }
-            // The UI does not need every chunk's update: 4/s plus one at each finished file.
-            if Date().timeIntervalSince(lastProgress) > 0.25 || doneState.isDone || doneState == .failed { lastProgress = Date(); progress(job) }
-            if doneState == .failed || doneState == .pending {
-                let item = items[idx]
-                if !fm.fileExists(atPath: srcRoot.path) || Volumes.find(job.sourceVolume!) == nil { stopReason = "Source drive disconnected."; break }
-                if Volumes.find(job.destinationVolume!) == nil { stopReason = "Destination drive disconnected."; break }
-                if item.message?.contains("No space") == true || item.message?.contains("ENOSPC") == true { stopReason = "Destination is full."; break }
-                if doneState == .pending { job.status = .paused; break } // cancelled mid-file
+        let pendingCount = items.filter { !$0.state.isDone }.count
+        let streamCount = max(1, min(4, pendingCount))
+        let group = DispatchGroup()
+        let workQueue = DispatchQueue(label: "app.editorworkflow.copy", qos: .userInitiated, attributes: .concurrent)
+        for _ in 0..<streamCount {
+            group.enter()
+            workQueue.async {
+                defer { group.leave() }
+                while true {
+                    lock.lock()
+                    if stopAll || nextIdx >= items.count { lock.unlock(); break }
+                    let idx = nextIdx
+                    nextIdx += 1
+                    var item = items[idx]
+                    let snapshot = job
+                    lock.unlock()
+                    if item.state.isDone { continue }
+                    if isCancelled() {
+                        lock.lock(); stopAll = true; job.status = .paused; lock.unlock()
+                        break
+                    }
+                    var doneState: ItemState = .pending
+                    // Per-file autorelease pool: chunk buffers from thousands of files must not pile up.
+                    autoreleasepool {
+                        item.state = .copying
+                        item = self.copy(item, srcRoot: srcRoot, outRoot: outRoot,
+                                         policy: item.policy ?? snapshot.conflictPolicy,
+                                         sizeOnly: snapshot.verification == .sizeOnly,
+                                         scope: snapshot.scope ?? .all,
+                                         metaError: { msg in
+                                             lock.lock()
+                                             if job.metadataNotPreserved.count < 200 { job.metadataNotPreserved.append(msg) }
+                                             lock.unlock()
+                                         },
+                                         isCancelled: isCancelled,
+                                         activity: { file, phase in lock.lock(); activity(file, phase); lock.unlock() })
+                        lock.lock()
+                        items[idx] = item
+                        try? self.db.save("titem", id: job.id.uuidString + "|" + item.relativePath, parent: job.id.uuidString, item)
+                        if item.state.isDone { job.copiedBytes += item.bytes; job.doneFiles = (job.doneFiles ?? 0) + 1 }
+                        doneState = item.state
+                        if doneState == .failed || doneState == .pending {
+                            if !fm.fileExists(atPath: srcRoot.path) || snapshot.sourceVolume.map({ Volumes.find($0) == nil }) ?? true {
+                                stopReason = "Source drive disconnected."; stopAll = true
+                            } else if snapshot.destinationVolume.map({ Volumes.find($0) == nil }) ?? true {
+                                stopReason = "Destination drive disconnected."; stopAll = true
+                            } else if item.message?.contains("No space") == true || item.message?.contains("ENOSPC") == true {
+                                stopReason = "Destination is full."; stopAll = true
+                            } else if doneState == .pending {
+                                job.status = .paused; stopAll = true   // cancelled mid-file
+                            }
+                        }
+                        // The UI does not need every chunk's update: 4/s plus one at each finished file.
+                        if Date().timeIntervalSince(lastProgress) > 0.25 || doneState.isDone || doneState == .failed {
+                            lastProgress = Date()
+                            progress(job)
+                        }
+                        lock.unlock()
+                    }
+                }
             }
         }
+        group.wait()
 
         if let stopReason {
             job.status = .interrupted
@@ -445,7 +491,8 @@ final class TransferRunner {
 
     private func persist(_ job: TransferJob) { try? db.save("job", id: job.id.uuidString, job) }
 
-    private func copy(_ itemIn: TransferItem, srcRoot: URL, outRoot: URL, policy: ConflictPolicy, sizeOnly: Bool = false, job: inout TransferJob,
+    private func copy(_ itemIn: TransferItem, srcRoot: URL, outRoot: URL, policy: ConflictPolicy, sizeOnly: Bool = false,
+                      scope: CopyScope, metaError: (String) -> Void,
                       isCancelled: () -> Bool, activity: (String, String) -> Void = { _, _ in }) -> TransferItem {
         var item = itemIn
         let fm = FileManager.default
@@ -457,7 +504,6 @@ final class TransferRunner {
                 let srcSize = (try? fm.attributesOfItem(atPath: src.path))?[.size] as? NSNumber
                 let dstSize = (try? fm.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber
                 let sameSize = srcSize != nil && srcSize == dstSize
-                let scope = job.scope ?? .all
                 if scope == .missingOnly {
                     item.state = .skippedExisting; item.destinationRelativePath = item.relativePath
                     item.message = "Already at the destination; only missing files are copied."
@@ -515,7 +561,7 @@ final class TransferRunner {
                     return item
                 }
                 item.sourceHash = srcHash
-                preserveMetadata(from: src, to: temp, job: &job, rel: item.relativePath)
+                if let e = preserveMetadata(from: src, to: temp, rel: item.relativePath) { metaError(e) }
                 dst = try finalize(temp: temp, final: dst, overwrite: policy == .replace)
                 item.destinationRelativePath = String(dst.path.dropFirst(outRoot.path.count + 1))
                 item.state = .copiedUnverified
@@ -530,7 +576,7 @@ final class TransferRunner {
                 item.message = "Checksum mismatch: source \(srcHash.prefix(12))… destination \(dstHash.prefix(12))…. Not verified; source untouched."
                 return item
             }
-            preserveMetadata(from: src, to: temp, job: &job, rel: item.relativePath)
+            if let e = preserveMetadata(from: src, to: temp, rel: item.relativePath) { metaError(e) }
             dst = try finalize(temp: temp, final: dst, overwrite: policy == .replace)
             item.destinationRelativePath = String(dst.path.dropFirst(outRoot.path.count + 1))
             item.state = .verified
@@ -586,13 +632,13 @@ final class TransferRunner {
         throw NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST), userInfo: [NSLocalizedDescriptionKey: "No free name for \(final.lastPathComponent)"])
     }
 
-    private func preserveMetadata(from src: URL, to dst: URL, job: inout TransferJob, rel: String) {
-        guard let a = try? FileManager.default.attributesOfItem(atPath: src.path) else { return }
+    /// Copies timestamps and permissions; returns a log line when that fails (never fails the copy).
+    private func preserveMetadata(from src: URL, to dst: URL, rel: String) -> String? {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: src.path) else { return nil }
         var attrs: [FileAttributeKey: Any] = [:]
         for k in [FileAttributeKey.modificationDate, .creationDate, .posixPermissions] { if let v = a[k] { attrs[k] = v } }
-        do { try FileManager.default.setAttributes(attrs, ofItemAtPath: dst.path) } catch {
-            if job.metadataNotPreserved.count < 200 { job.metadataNotPreserved.append("\(rel): \(error.localizedDescription)") }
-        }
+        do { try FileManager.default.setAttributes(attrs, ofItemAtPath: dst.path); return nil }
+        catch { return "\(rel): \(error.localizedDescription)" }
     }
 
     static func uniqueName(for url: URL) -> URL {

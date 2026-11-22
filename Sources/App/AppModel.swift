@@ -48,7 +48,7 @@ struct AppSettings: Codable, Equatable {
     var autoOpen: AutoOpenMode?
     var trustedOnly: Bool?
     var trustedDrives: [String]?
-    /// Jobs allowed at once, each on a different destination drive. 1 = strictly one at a time.
+    /// Jobs allowed at once (default 4). 1 = strictly one at a time.
     var maxConcurrent: Int?
     var resolveAppPath: String?
     /// Unsplash API access key for automatic template covers (Openverse is used without one).
@@ -630,16 +630,12 @@ final class AppModel: ObservableObject {
 
     private func persistQueue() { try? db.save("queue", id: "order", queue) }
 
-    /// Starts queued jobs: at most `maxConcurrent`, never two writing to the same destination drive.
+    /// Starts queued jobs: at most `maxConcurrent` (default 4). Jobs may share a destination
+    /// drive — `enqueue` already refuses jobs whose output folders overlap.
     func pump() {
-        let limit = max(1, settings.maxConcurrent ?? 3)
-        while running.count < limit {
-            let busyVolumes = Set(jobs.filter { running.contains($0.id) }.compactMap { $0.destinationVolume?.uuid ?? $0.destinationRoot })
-            guard let idx = queue.firstIndex(where: { id in
-                guard let j = db.get("job", id: id.uuidString, as: TransferJob.self) else { return true }
-                return !busyVolumes.contains(j.destinationVolume?.uuid ?? j.destinationRoot)
-            }) else { return }
-            let id = queue.remove(at: idx); persistQueue()
+        let limit = max(1, settings.maxConcurrent ?? 4)
+        while running.count < limit, !queue.isEmpty {
+            let id = queue.removeFirst(); persistQueue()
             guard let job = db.get("job", id: id.uuidString, as: TransferJob.self) else { continue }
             start(job)
         }
