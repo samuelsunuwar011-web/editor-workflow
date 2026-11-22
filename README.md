@@ -1,0 +1,58 @@
+# Editor Workflow
+
+A native macOS app that copies and verifies footage, keeps reusable DaVinci Resolve `.drp` templates, and prepares projects. Resolve Studio projects are automated, but only for steps proven to work. Resolve Free gets an honest guided checklist.
+The spec is `Editor_Workflow_App_Product_Specification.pdf` (v1.0).
+
+## Build and run (Xcode not needed)
+```bash
+scripts/test.sh                 # self-tests (EW_BIG=1 adds the >4 GiB test)
+scripts/build.sh                # -> build/Editor Workflow.app
+open "build/Editor Workflow.app"
+```
+Requires macOS 15+ (Sequoia) on Apple Silicon and the Xcode Command Line Tools. The build uses plain `swiftc`:
+- No SwiftPM. It needs a nested sandbox, which some environments block.
+- No `@State`. In current SDKs it is a macro whose plugin ships only with Xcode, so `Sources/App/Local.swift` provides `@Local` instead.
+
+For Studio automation, set Resolve > Preferences > System > General > **External scripting using: Local**.
+
+## Layout
+| Path | What it does |
+|---|---|
+| `Sources/Core/TransferEngine.swift` | Plan and preflight, then streams each file into a hidden `.ewpart` temp file. Computes SHA-256 of source and destination, then renames atomically (never overwrites unless Replace is confirmed). Keeps a per-file journal, supports resume after volume revalidation, and writes JSON/CSV manifests |
+| `Sources/Core/Templates.swift` | Stores immutable masters (read-only, checksummed) with versioning, metadata, export and duplicate |
+| `Sources/Core/Projects.swift` | Project folders, `.drp` instance copy, bin-mapping suggestions, Free checklist, truthful state rules, wizard drafts |
+| `Sources/Core/Resolve.swift` + `Resources/resolve_bridge.py` | Detects edition through `GetProductName()`, runs proven Studio steps, and returns one receipt per step |
+| `Sources/Core/Database.swift` | SQLite document store in `~/Library/Application Support/EditorWorkflow/` |
+| `Sources/App/*` | SwiftUI shell, menu bar extra, dual-panel transfers, template library, five-step wizard, projects, history, settings |
+| `docs/capability-matrix.md` | Resolve calls tested live (Gate 0) |
+| `docs/acceptance.md` | Spec acceptance cases and how each is verified |
+
+## Safety rules the code enforces
+- Copy only: nothing is moved or deleted. Source files are opened read-only.
+- "Verified" requires matching SHA-256 hashes. A mismatch is reported as a failure and the bad file is never finalized.
+- A drive is matched by volume UUID, never by name.
+- Template masters are never written. Each project gets its own `.drp` copy, and Studio imports into Resolve's database.
+- Project state comes only from real receipts.
+
+## Transfers (0.10)
+- **Compare with destination** (Options menu on the Copy page): *Copy everything*, *Continue — skip files already copied*, or *Only files missing at the destination*. The review screen then shows how many files already exist with the same size, how many differ, and how many bytes will actually move.
+- **Continue** on an interrupted or failed job resumes where it stopped; finished files are never recopied.
+- Several transfers run at once (default 3, Settings → "Transfers at once", up to 6). Two jobs never write to the same destination drive simultaneously. The menu bar shows `2× 45%` while several run; the queue badge counts them.
+- The panel closes when you click outside it even mid-copy — the copy keeps going (Finder-like).
+- Big-file hardening: per-file autorelease pools, throttled UI updates, content hashing skipped when file sizes already differ, `F_FULLFSYNC` only for files ≥128 MB (plain `fsync` otherwise, several seconds faster per small file on external drives).
+- **Video preview in the browser**: play button on the selected row, right-click → Preview, or Enter — inline player for video/audio, image viewer for photos.
+- The expand button in the popover opens the panel as a centered window instead of a half-clipped popover.
+- **Keyboard cleaning mode** (⋯ menu): one event tap swallows keyboard, scroll and gestures; mouse still works. Unlock with the button or Esc ×5. Requires Accessibility permission (the app asks and links to Settings).
+- **Scratchpad**: multiple named notes with a dropdown, rename/close/clear/save-as-`.txt`, autosaved; files and photos dragged in show up as a thumbnail shelf.
+- **Background activity monitor**: running processes with memory and CPU, sortable, with force quit (⚠ asks first).
+
+## Uninstall
+1. Double-click `Uninstall Editor Workflow.command` (it is installed in `/Applications` and also sits beside the package). Answer `y` to remove the app, login item, preferences and caches; answer `y` to the second question to delete the library too. Add `--purge` for a silent full removal: `./Uninstall\ Editor\ Workflow.command --yes --purge`.
+2. Or by hand: quit the app, delete `Editor Workflow.app` and `~/Library/LaunchAgents/app.editorworkflow.mac.plist`, then delete `~/Library/Application Support/EditorWorkflow/` (library, history, logs). Settings → "Delete App Records…" does the same from inside the app.
+
+Every copy is removed (any version, any place it was unzipped). Footage, project folders, original `.drp` files and Resolve projects are never stored there, so uninstalling leaves them untouched.
+
+## Templates that ship with the package
+`scripts/seed.sh` exports this Mac's template library into `Resources/templates/` (`.drp` + cover + `seeds.json`); `scripts/build.sh` puts it in the app bundle. On first launch the app imports each seed once and remembers the keys, so nothing is imported twice and a template you delete stays deleted. Your own library already has those names, so nothing duplicates here.
+
+Traceability of every spec requirement: `docs/spec-traceability.md`.

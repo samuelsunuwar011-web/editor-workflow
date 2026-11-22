@@ -1,0 +1,24 @@
+{
+  "seeds" : [
+    {
+      "category" : "",
+      "file" : "master.drp",
+      "key" : "master",
+      "name" : "master",
+      "summary" : "",
+      "tags" : [
+
+      ]
+    },
+    {
+      "category" : "",
+      "file" : "wedding long (slog).drp",
+      "key" : "wedding-long-(slog)",
+      "name" : "wedding long (slog)",
+      "summary" : "",
+      "tags" : [
+
+      ]
+    }
+  ]
+}
