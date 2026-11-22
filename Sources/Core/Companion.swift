@@ -84,7 +84,7 @@ enum DrivePolicy {
 
 // MARK: - Persisted companion state (spec p.19)
 
-enum CompanionTab: String, Codable, CaseIterable { case transfer, favorites, create, shelf, notes }
+enum CompanionTab: String, Codable, CaseIterable { case transfer, favorites, create, shelf, notes, activity, cleaning }
 enum TransferStage: String, Codable { case source, destination, review }
 
 /// Everything the menu bar must keep when the panel closes, the app restarts, or the user switches tabs.

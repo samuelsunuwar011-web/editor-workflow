@@ -205,6 +205,61 @@ final class CleaningModeController: NSObject, ObservableObject {
 
 // MARK: Overlay UI
 
+/// Panel tab page: start/stop cleaning mode, status, and how it works.
+struct CleaningPage: View {
+    @ObservedObject private var controller: CleaningModeController = .shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Keyboard Cleaning Mode", systemImage: "keyboard").font(.headline)
+                Spacer()
+                status
+            }
+            Text("Blocks keyboard, media keys, scrolling, gestures and modifier shortcuts system-wide while it runs — no stray keystrokes reach DaVinci while you wipe the keys. The mouse keeps working.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button {
+                    if controller.active { controller.stop() } else { _ = controller.start() }
+                } label: {
+                    Label(controller.active ? "Stop & Unlock" : "Start Cleaning Mode",
+                          systemImage: controller.active ? "lock.open" : "lock")
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(controller.active ? Color.red.opacity(0.85) : Theme.accent, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.defaultAction)
+                if controller.active {
+                    HStack(spacing: 4) {
+                        ForEach(0..<5, id: \.self) { i in
+                            Circle().fill(i < controller.escapeProgress ? Theme.accent : Color.secondary.opacity(0.3))
+                                .frame(width: 8, height: 8)
+                        }
+                        Text("Esc \(controller.escapeProgress)/5").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Unlock: the button above, or press Esc 5 times within 6 s of each other.", systemImage: "escape")
+                Label("Needs Accessibility permission — macOS requires it for any event tap. The mode never engages without a guaranteed way out.", systemImage: "hand.raised")
+                Label("Other keys reset the Esc counter.", systemImage: "arrow.counterclockwise")
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+    }
+
+    private var status: some View {
+        HStack(spacing: 6) {
+            Circle().fill(controller.active ? Color.green : Color.secondary.opacity(0.4)).frame(width: 8, height: 8)
+            Text(controller.active ? "Active — keys blocked" : "Off").font(.caption.weight(.medium))
+        }
+    }
+}
+
 struct CleaningOverlayView: View {
     @ObservedObject private var controller: CleaningModeController = .shared
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import ImageIO
 
 // Scratchpad (modeled on Vorssaint's Scratchpad + Shelf, GPL-3.0):
 // up to 12 named notes in a dropdown, autosaved to JSON, plus a shelf of dragged-in
@@ -162,7 +163,73 @@ final class ScratchpadStore: ObservableObject {
     }
 }
 
-// MARK: Shelf tab — the photo/file shelf, with smart drop routing
+// MARK: Shelf tab — the photo shelf, with smart drop routing
+
+/// Resolves dropped providers to file URLs. File drops give a URL directly; image data
+/// (Photos app, browser, screenshots) is written into the shelf folder first so it has a path.
+enum ShelfIngest {
+    static let dir: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("EditorWorkflow")
+        return base.appendingPathComponent("Shelf")
+    }()
+
+    static func run(_ providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
+        let lock = NSLock()
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        for p in providers {
+            group.enter()
+            take(p) { url in
+                if let url { lock.lock(); urls.append(url); lock.unlock() }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { completion(urls) }
+    }
+
+    private static func take(_ p: NSItemProvider, _ done: @escaping (URL?) -> Void) {
+        if p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            _ = p.loadObject(ofClass: URL.self) { u, _ in
+                if let u { done(u) }
+                else if p.hasItemConformingToTypeIdentifier(UTType.image.identifier) { imageData(p, done) }
+                else { done(nil) }
+            }
+        } else if p.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            imageData(p, done)
+        } else {
+            done(nil)
+        }
+    }
+
+    private static func imageData(_ p: NSItemProvider, _ done: @escaping (URL?) -> Void) {
+        _ = p.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+            done(data.flatMap { save($0, suggested: p.suggestedName) })
+        }
+    }
+
+    private static func save(_ data: Data, suggested: String?) -> URL? {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let raw = (suggested ?? "").trimmingCharacters(in: .whitespaces)
+        let base = raw.isEmpty ? "Image \(ISO8601DateFormatter().string(from: Date()))" : (raw as NSString).deletingPathExtension
+        let ext = extensionFor(suggested: raw, data: data)
+        var url = dir.appendingPathComponent("\(base).\(ext)")
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent("\(base) \(n).\(ext)"); n += 1
+        }
+        return (try? data.write(to: url, options: .atomic)) != nil ? url : nil
+    }
+
+    private static func extensionFor(suggested: String, data: Data) -> String {
+        let fromName = (suggested as NSString).pathExtension.lowercased()
+        if !fromName.isEmpty { return fromName }
+        if let src = CGImageSourceCreateWithData(data as CFData, nil),
+           let ut = UTType(CGImageSourceGetType(src) as String? ?? ""),
+           let ext = ut.preferredFilenameExtension { return ext }
+        return "png"
+    }
+}
 
 /// Top-level Shelf tab. Photos drop straight onto the shelf as thumbnails;
 /// a .drp routes to Add Template (it becomes a template), a folder or footage
@@ -192,18 +259,8 @@ struct ShelfPage: View {
             }
         }
         .padding(.vertical, 4)
-        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-            let lock = NSLock()
-            var urls: [URL] = []
-            let group = DispatchGroup()
-            for p in providers {
-                group.enter()
-                _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    if let url { lock.lock(); urls.append(url); lock.unlock() }
-                    group.leave()
-                }
-            }
-            group.notify(queue: .main) { route(urls) }
+        .onDrop(of: [.fileURL, .image], isTargeted: $dropTargeted) { providers in
+            ShelfIngest.run(providers) { route($0) }
             return true
         }
         .overlay {
@@ -291,6 +348,7 @@ struct ShelfCard: View {
         }
         .padding(6)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .onTapGesture(count: 2) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
         .contextMenu {
             Button("Open") { NSWorkspace.shared.open(url) }
             Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
@@ -298,7 +356,7 @@ struct ShelfCard: View {
             Divider()
             Button("Remove from Shelf", role: .destructive, action: onRemove)
         }
-        .help("\(item.name) — drop photos to add, right click for actions")
+        .help("\(item.name) — double-click reveals in Finder, right-click for actions")
     }
 
     @ViewBuilder private func thumb(ext: String, url: URL) -> some View {

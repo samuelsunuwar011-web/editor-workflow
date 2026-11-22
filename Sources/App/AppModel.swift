@@ -107,11 +107,19 @@ final class AppModel: ObservableObject {
     /// A .drp dropped on the menu bar icon, waiting for the Add Template page to take it.
     @Published var pendingTemplateDrop: URL?
 
-    /// .drp → Add Template. Folder or media file → New Project with that footage.
+    /// Photos → Shelf. .drp → Add Template. Folder or footage → New Project with that media.
     func handleDropped(_ urls: [URL]) {
-        guard let u = urls.first else { return }
-        if urls.count > 1 {
-            errorMessage = "Drop one .drp or one footage folder at a time. Add extra media folders in the project wizard."
+        guard !urls.isEmpty else { return }
+        // Photos are the shelf's job — route them there no matter where they were dropped.
+        let images = urls.filter { AppModel.imageExts.contains($0.pathExtension.lowercased()) }
+        let rest = urls.filter { !AppModel.imageExts.contains($0.pathExtension.lowercased()) }
+        if !images.isEmpty {
+            ScratchpadStore.shared.addShelf(urls: images)
+            companion.tab = .shelf
+        }
+        guard let u = rest.first else { return }
+        if rest.count > 1 {
+            errorMessage = "Drop one .drp or one footage folder at a time. Photos all go to the Shelf; add extra media folders in the project wizard."
             return
         }
         if u.pathExtension.lowercased() == "drp" {
@@ -122,6 +130,7 @@ final class AppModel: ObservableObject {
             companion.tab = .favorites
         }
     }
+    static let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp", "ico", "avif"]
     /// Copies being checked again right now.
     @Published private(set) var rechecking: Set<UUID> = []
     /// Projects whose Resolve import is running right now.

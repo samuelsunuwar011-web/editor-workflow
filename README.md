@@ -46,6 +46,12 @@ For Studio automation, set Resolve > Preferences > System > General > **External
 - **Scratchpad**: multiple named notes with a dropdown, rename/close/clear/save-as-`.txt`, autosaved; files and photos dragged in show up as a thumbnail shelf.
 - **Background activity monitor**: running processes with memory and CPU, sortable, with force quit (⚠ asks first).
 
+## Panel tabs (0.11)
+- **Shelf** is photos-only: dropping images (Finder, Photos app, screenshots — file or raw image data) stores them as thumbnails on the shelf. Double-click a photo to reveal it in Finder; right-click for Open / Reveal / Start Project / Remove. Dropping a `.drp` still routes to Add Template, footage still routes to New Project.
+- **Activity** tab: the process monitor inside the panel, grouped by app — one row per app with its icon, aggregated CPU and memory, and a "Using most:" line naming the top CPU consumers. Expand a row to see its individual processes; tick rows (or all) and use **Quit Selected** or **Quit All** (both ask first; this app and system processes are skipped by Quit All).
+- **Clean** tab: Keyboard Cleaning Mode from inside the panel — start/stop, live Esc ×5 unlock progress, and the permission notes. While active the full-screen shield still covers every display.
+- Panel widened to 800 (960 expanded) so the new tabs have room.
+
 ## Uninstall
 1. Double-click `Uninstall Editor Workflow.command` (it is installed in `/Applications` and also sits beside the package). Answer `y` to remove the app, login item, preferences and caches; answer `y` to the second question to delete the library too. Add `--purge` for a silent full removal: `./Uninstall\ Editor\ Workflow.command --yes --purge`.
 2. Or by hand: quit the app, delete `Editor Workflow.app` and `~/Library/LaunchAgents/app.editorworkflow.mac.plist`, then delete `~/Library/Application Support/EditorWorkflow/` (library, history, logs). Settings → "Delete App Records…" does the same from inside the app.

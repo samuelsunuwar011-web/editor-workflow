@@ -3,8 +3,8 @@ import AppKit
 import Combine
 import Darwin
 
-/// "Background Activity": a Force Quit / Activity Monitor lite window.
-/// The host app opens it with `ProcessMonitorController.shared.open()` (main thread).
+/// "Background Activity": an Activity Monitor lite, grouped by app.
+/// Opens as its own window (`ProcessMonitorController.shared.open()`) and as the panel's Activity tab.
 /// Self-contained: no AppModel, no environment objects, nothing else in the app needs to change.
 
 // MARK: - Model
@@ -48,13 +48,36 @@ struct ProcessMonitorRow: Identifiable {
     static func gigabytes(_ kib: Int64) -> String { String(format: "%.1f GB", Double(kib) / 1_048_576) }
 }
 
+/// All processes of one app, aggregated: what the user actually wants to see
+/// ("DaVinci Resolve — 6 processes, 312 % CPU, 4.2 GB").
+struct ProcessAppGroup: Identifiable {
+    /// Bundle path when the processes came from a .app, otherwise the executable path.
+    let key: String
+    /// Display name: bundle name without ".app", else the executable's last component.
+    let name: String
+    let icon: NSImage
+    /// Sum of the members' ps CPU (multi-core apps exceed 100).
+    let cpu: Double
+    let rssKB: Int64
+    /// Member pids, ascending — the quit order.
+    let pids: [Int32]
+    let isOwnApp: Bool
+    /// Every member is marked killed.
+    let killed: Bool
+    /// First failed-quit error, if any member refused to die.
+    let killError: String?
+
+    var id: String { key }
+    var procCount: Int { pids.count }
+}
+
 /// Sort columns; the header cycles ascending/descending for the clicked one.
 enum ProcessMonitorSort: String, CaseIterable {
     case name, pid, cpu, memory
     var title: String {
         switch self {
-        case .name: return "Name"
-        case .pid: return "PID"
+        case .name: return "App"
+        case .pid: return "Procs"
         case .cpu: return "CPU"
         case .memory: return "Memory"
         }
@@ -64,9 +87,14 @@ enum ProcessMonitorSort: String, CaseIterable {
 @MainActor
 final class ProcessMonitorModel: ObservableObject {
     @Published private(set) var rows: [ProcessMonitorRow] = []
+    @Published private(set) var groups: [ProcessAppGroup] = []
     @Published private(set) var sortKey: ProcessMonitorSort = .memory
     @Published private(set) var sortAscending = false
     @Published var search = ""
+    /// App-group keys ticked for "Quit Selected".
+    @Published var selection: Set<String> = []
+    /// App-groups expanded to show their individual processes.
+    @Published var expanded: Set<String> = []
     @Published private(set) var rssTotalKB: Int64 = 0
     @Published private(set) var cpuTotal: Double = 0
     @Published private(set) var psError: String?
@@ -86,8 +114,8 @@ final class ProcessMonitorModel: ObservableObject {
 
     // MARK: Data
 
-    /// Rebuilds `rows` from ps. Consecutive refreshes merge: an existing pid keeps its icon and its
-    /// kill state, and CPU stays whatever ps reported (ps already averages it over the process lifetime).
+    /// Rebuilds `rows` and `groups` from ps. Consecutive refreshes merge: an existing pid keeps its
+    /// icon and its kill state, and CPU stays whatever ps reported (ps already averages it).
     func refresh() {
         guard let text = Self.psOutput() else {
             psError = "ps did not run"
@@ -111,6 +139,11 @@ final class ProcessMonitorModel: ObservableObject {
         rows = out
         rssTotalKB = totalKB
         cpuTotal = totalCPU
+        groups = Self.aggregate(out)
+        // Drop ticks and expansions for apps that just vanished.
+        let aliveKeys = Set(groups.map(\.key))
+        selection = selection.intersection(aliveKeys)
+        expanded = expanded.intersection(aliveKeys)
         psError = nil
     }
 
@@ -156,6 +189,61 @@ final class ProcessMonitorModel: ObservableObject {
         return command == ownExecutable || command.hasPrefix(ownBundlePath + "/")
     }
 
+    /// Groups ps rows into apps: anything under a .app (or under .../Contents/) belongs to that bundle;
+    /// loose binaries each form their own group.
+    static func aggregate(_ rows: [ProcessMonitorRow]) -> [ProcessAppGroup] {
+        struct Acc {
+            var name = ""
+            var cpu = 0.0
+            var rssKB: Int64 = 0
+            var pids: [Int32] = []
+            var own = false
+            var killed = true
+            var error: String?
+            var sample = ""
+        }
+        var byKey: [String: Acc] = [:]
+        for row in rows {
+            let (key, name) = appKey(row.command)
+            var g = byKey[key] ?? Acc()
+            if g.name.isEmpty { g.name = name; g.sample = row.command }
+            g.cpu += row.cpu
+            g.rssKB += row.rssKB
+            g.pids.append(row.pid)
+            g.own = g.own || row.isOwnApp
+            g.killed = g.killed && row.killed
+            if let e = row.killError, g.error == nil { g.error = e }
+            byKey[key] = g
+        }
+        return byKey.map { key, g in
+            ProcessAppGroup(key: key, name: g.name, icon: iconForGroup(g.sample),
+                            cpu: g.cpu, rssKB: g.rssKB, pids: g.pids.sorted(), isOwnApp: g.own,
+                            killed: g.killed, killError: g.error)
+        }
+    }
+
+    /// Bundle path when the executable lives inside a .app, else the executable path itself.
+    static func appKey(_ command: String) -> (key: String, name: String) {
+        if let r = command.range(of: ".app/"), r.upperBound < command.endIndex {
+            let bundle = String(command[..<r.upperBound])          // includes ".app/"
+            let path = String(bundle.dropLast())                   // strip trailing "/"
+            return (path, (path as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""))
+        }
+        if let r = command.range(of: "/Contents/") {
+            let path = String(command[..<r.lowerBound])
+            return (path, (path as NSString).lastPathComponent)
+        }
+        let name = (command as NSString).lastPathComponent
+        return (command, name.isEmpty ? command : name)
+    }
+
+    private static func iconForGroup(_ command: String) -> NSImage {
+        if command.hasPrefix("/") {
+            return NSWorkspace.shared.icon(forFile: command)
+        }
+        return ProcessMonitorRow.genericIcon
+    }
+
     private func icon(for command: String) -> NSImage {
         if let cached = icons[command] { return cached }
         // Only absolute paths have a real icon; anything else gets the generic app glyph.
@@ -168,28 +256,63 @@ final class ProcessMonitorModel: ObservableObject {
 
     // MARK: Sorting and filtering
 
-    var visibleRows: [ProcessMonitorRow] {
-        var list = rows
+    /// Groups after search + sort — what the list renders.
+    var visibleGroups: [ProcessAppGroup] {
         let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        var list = groups
         if !q.isEmpty {
-            list = list.filter { $0.name.localizedCaseInsensitiveContains(q) || String($0.pid).contains(q) }
+            list = list.filter { g in
+                g.name.localizedCaseInsensitiveContains(q)
+                    || g.pids.contains { String($0).contains(q) }
+                    || rows.contains { $0.command.contains(q) && Self.appKey($0.command).key == g.key }
+            }
         }
         let key = sortKey
         list.sort { a, b in
             switch key {
             case .name: return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-            case .pid: return a.pid < b.pid
+            case .pid: return a.procCount < b.procCount
             case .cpu: return a.cpu < b.cpu
             case .memory: return a.rssKB < b.rssKB
             }
         }
-        // Ties keep a stable pid order so the list doesn't shuffle between refreshes.
         if !sortAscending { list.reverse() }
         return list
     }
 
+    /// Members of one expanded group, filtered by the same search, in pid order.
+    func visibleMembers(of group: ProcessAppGroup) -> [ProcessMonitorRow] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        return rows.filter { row in
+            guard group.pids.contains(row.pid) else { return false }
+            if q.isEmpty { return true }
+            return row.name.localizedCaseInsensitiveContains(q) || String(row.pid).contains(q) || row.command.localizedCaseInsensitiveContains(q)
+        }
+        .sorted { $0.pid < $1.pid }
+    }
+
     func setSort(_ key: ProcessMonitorSort) {
         if sortKey == key { sortAscending.toggle() } else { sortKey = key; sortAscending = true }
+    }
+
+    func toggleSelect(_ group: ProcessAppGroup) {
+        if selection.contains(group.key) { selection.remove(group.key) } else { selection.insert(group.key) }
+    }
+
+    func toggleExpand(_ group: ProcessAppGroup) {
+        if expanded.contains(group.key) { expanded.remove(group.key) } else { expanded.insert(group.key) }
+    }
+
+    /// Ticks (or unticks) every group the search currently shows.
+    func toggleSelectAll() {
+        let visible = visibleGroups.map(\.key)
+        if visible.allSatisfy({ selection.contains($0) }) { selection.subtract(visible) }
+        else { selection.formUnion(visible) }
+    }
+
+    var allVisibleSelected: Bool {
+        let visible = visibleGroups.map(\.key)
+        return !visible.isEmpty && visible.allSatisfy { selection.contains($0) }
     }
 
     // MARK: Summary
@@ -204,6 +327,11 @@ final class ProcessMonitorModel: ObservableObject {
 
     var overMemoryBudget: Bool { Double(rssTotalKB) * 1024 > 0.7 * Double(ProcessInfo.processInfo.physicalMemory) }
 
+    /// The heaviest apps right now — "show me what's using the most".
+    var topConsumers: [ProcessAppGroup] {
+        groups.sorted { $0.cpu > $1.cpu }.prefix(3).filter { $0.cpu >= 1 }.map { $0 }
+    }
+
     // MARK: Force Quit
 
     func forceQuit(_ row: ProcessMonitorRow) {
@@ -215,11 +343,48 @@ final class ProcessMonitorModel: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.contentTintColor = .systemRed
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        // errno is read immediately: strerror of a stale errno would name the wrong failure.
-        if kill(row.pid, SIGKILL) == 0 {
-            states[row.pid] = RowState(killed: true, error: nil)
-        } else {
-            states[row.pid] = RowState(killed: false, error: String(cString: strerror(errno)))
+        killPids([row.pid])
+    }
+
+    /// One confirmation, then every pid of every ticked app.
+    func forceQuit(selectedGroups: [ProcessAppGroup]) {
+        guard !selectedGroups.isEmpty else { return }
+        let procs = selectedGroups.reduce(0) { $0 + $1.procCount }
+        let alert = NSAlert()
+        alert.messageText = "Force quit \(selectedGroups.count) app(s), \(procs) process(es)?"
+        alert.informativeText = selectedGroups.map(\.name).joined(separator: ", ") + "\n\nUnsaved data in those apps will be lost."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Force Quit")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.contentTintColor = .systemRed
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        killPids(selectedGroups.flatMap(\.pids))
+    }
+
+    /// Everything on screen except this app (killing ourselves would take the panel down mid-confirm).
+    func quitAll(visibleGroups visible: [ProcessAppGroup]) {
+        let targets = visible.filter { !$0.isOwnApp }
+        guard !targets.isEmpty else { return }
+        let procs = targets.reduce(0) { $0 + $1.procCount }
+        let alert = NSAlert()
+        alert.messageText = "Force quit all \(targets.count) app(s), \(procs) process(es)?"
+        alert.informativeText = "This app and macOS system processes are skipped. Unsaved data in everything else will be lost."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit All")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.contentTintColor = .systemRed
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        killPids(targets.flatMap(\.pids))
+    }
+
+    private func killPids(_ pids: [Int32]) {
+        for pid in pids {
+            // errno is read immediately: strerror of a stale errno would name the wrong failure.
+            if kill(pid, SIGKILL) == 0 {
+                states[pid] = RowState(killed: true, error: nil)
+            } else {
+                states[pid] = RowState(killed: false, error: String(cString: strerror(errno)))
+            }
         }
         refresh()
     }
@@ -232,7 +397,8 @@ struct ProcessMonitorView: View {
 
     /// Column widths shared by the header and every row, so the two stay aligned.
     enum Col {
-        static let pid: CGFloat = 64
+        static let check: CGFloat = 22
+        static let procs: CGFloat = 56
         static let cpu: CGFloat = 74
         static let mem: CGFloat = 88
         static let quit: CGFloat = 30
@@ -271,19 +437,39 @@ struct ProcessMonitorView: View {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
                 TextField("Search", text: $model.search)
                     .textFieldStyle(.plain)
-                    .accessibilityLabel("Search processes by name or PID")
+                    .accessibilityLabel("Search apps or processes by name or PID")
             }
             .padding(.horizontal, 8)
-            .frame(width: 200, height: 28)
+            .frame(width: 170, height: 28)
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             .help("Filter by name or PID")
 
             Spacer(minLength: 8)
 
+            Button {
+                model.forceQuit(selectedGroups: model.visibleGroups.filter { model.selection.contains($0.key) })
+            } label: {
+                Label("Quit Selected", systemImage: "xmark.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.selection.isEmpty)
+            .help("Force quit every ticked app")
+            .accessibilityLabel("Force quit selected apps")
+
+            Button {
+                model.quitAll(visibleGroups: model.visibleGroups)
+            } label: {
+                Label("Quit All", systemImage: "power")
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+            .help("Force quit every visible app except this one and system processes")
+            .accessibilityLabel("Quit all visible apps")
+
             VStack(alignment: .leading, spacing: 4) {
                 ProgressView(value: model.pressure, total: 1)
                     .progressViewStyle(.linear)
-                    .frame(width: 160)
+                    .frame(width: 130)
                     // Memory pressure colours: green, then orange, red past 80 %.
                     .tint(model.pressure > 0.8 ? .red : model.pressure > 0.6 ? .orange : .green)
                     .accessibilityLabel("Memory pressure")
@@ -302,7 +488,7 @@ struct ProcessMonitorView: View {
     private var summary: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 14) {
-                Text("\(model.rows.count) processes")
+                Text("\(model.groups.count) apps · \(model.rows.count) processes")
                 Text("\(ProcessMonitorRow.memoryText(model.rssTotalKB)) memory")
                 Text(String(format: "%.1f%% CPU", model.cpuTotal))
                 Spacer(minLength: 8)
@@ -313,7 +499,20 @@ struct ProcessMonitorView: View {
             .font(.callout)
             .foregroundStyle(.secondary)
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(model.rows.count) processes, \(ProcessMonitorRow.memoryText(model.rssTotalKB)) of memory, \(String(format: "%.1f", model.cpuTotal)) percent CPU")
+            .accessibilityLabel("\(model.groups.count) apps, \(model.rows.count) processes, \(ProcessMonitorRow.memoryText(model.rssTotalKB)) of memory, \(String(format: "%.1f", model.cpuTotal)) percent CPU")
+
+            if !model.topConsumers.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "flame").font(.caption).foregroundStyle(.orange).accessibilityHidden(true)
+                    Text("Using most: " + model.topConsumers.map { "\($0.name) \(String(format: "%.0f%%", $0.cpu))" }.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Using most CPU: " + model.topConsumers.map { "\($0.name), \(String(format: "%.0f", $0.cpu)) percent" }.joined(separator: ", "))
+            }
 
             if model.overMemoryBudget {
                 Label("System has run out of application memory — quit what you don't need.",
@@ -330,12 +529,23 @@ struct ProcessMonitorView: View {
 
     private var columnHeader: some View {
         HStack(spacing: 8) {
+            Button { model.toggleSelectAll() } label: {
+                Image(systemName: model.allVisibleSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 13))
+                    .foregroundStyle(model.allVisibleSelected ? Theme.accent : Color.secondary)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(width: Col.check)
+            .help("Select every app in the list")
+            .accessibilityLabel("Select all apps")
+
             HStack(spacing: 8) {
                 Color.clear.frame(width: 16).accessibilityHidden(true)
                 headerButton(.name)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            headerButton(.pid).frame(width: Col.pid, alignment: .trailing)
+            headerButton(.pid).frame(width: Col.procs, alignment: .trailing)
             headerButton(.cpu).frame(width: Col.cpu, alignment: .trailing)
             headerButton(.memory).frame(width: Col.mem, alignment: .trailing)
             Color.clear.frame(width: Col.quit).accessibilityHidden(true)
@@ -370,17 +580,26 @@ struct ProcessMonitorView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if model.rows.isEmpty {
                     empty("Reading processes…")
-                } else if model.visibleRows.isEmpty {
+                } else if model.visibleGroups.isEmpty {
                     empty("No match")
                 } else {
-                    ForEach(model.visibleRows) { row in
-                        ProcessRowView(row: row, forceQuit: { model.forceQuit($0) })
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 5)
-                            .contentShape(Rectangle())
-                            .contextMenu { rowMenu(row) }
-                            .accessibilityElement(children: .contain)
-                            .accessibilityLabel("\(row.name), process \(row.pid), \(String(format: "%.1f", row.cpu)) percent CPU, \(ProcessMonitorRow.memoryText(row.rssKB))")
+                    ForEach(model.visibleGroups) { group in
+                        AppGroupRow(
+                            group: group,
+                            selected: model.selection.contains(group.key),
+                            expanded: model.expanded.contains(group.key),
+                            members: model.expanded.contains(group.key) ? model.visibleMembers(of: group) : [],
+                            onToggleSelect: { model.toggleSelect(group) },
+                            onToggleExpand: { model.toggleExpand(group) },
+                            forceQuit: { model.forceQuit($0) },
+                            forceQuitGroup: { model.forceQuit(selectedGroups: [group]) }
+                        )
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .contentShape(Rectangle())
+                        .contextMenu { rowMenu(group) }
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel("\(group.name), \(group.procCount) processes, \(String(format: "%.1f", group.cpu)) percent CPU, \(ProcessMonitorRow.memoryText(group.rssKB))")
                         Divider().padding(.leading, 12)
                     }
                 }
@@ -397,13 +616,14 @@ struct ProcessMonitorView: View {
     }
 
     @ViewBuilder
-    private func rowMenu(_ row: ProcessMonitorRow) -> some View {
-        Button("Force Quit…") { model.forceQuit(row) }
-            .disabled(row.killed)
-            .help("Quit this process; unsaved data will be lost")
+    private func rowMenu(_ group: ProcessAppGroup) -> some View {
+        Button(model.expanded.contains(group.key) ? "Collapse Processes" : "Expand Processes") { model.toggleExpand(group) }
+        Button("Quit This App…") { model.forceQuit(selectedGroups: [group]) }
+            .disabled(group.killed)
+            .help("Quit every process of this app; unsaved data will be lost")
         Divider()
-        Button("Copy PID") { copy("\(row.pid)" ) }
-        Button("Copy Command") { copy(row.command) }
+        Button(model.selection.contains(group.key) ? "Deselect" : "Select for Quit") { model.toggleSelect(group) }
+        Button("Copy App Path") { copy(group.key) }
     }
 
     private func copy(_ text: String) {
@@ -412,26 +632,62 @@ struct ProcessMonitorView: View {
     }
 }
 
-// MARK: - Row
+// MARK: - Group row
 
-private struct ProcessRowView: View {
-    let row: ProcessMonitorRow
+private struct AppGroupRow: View {
+    let group: ProcessAppGroup
+    let selected: Bool
+    let expanded: Bool
+    let members: [ProcessMonitorRow]
+    let onToggleSelect: () -> Void
+    let onToggleExpand: () -> Void
     let forceQuit: (ProcessMonitorRow) -> Void
+    let forceQuitGroup: () -> Void
+    @Local private var hovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 8) {
-                Image(nsImage: row.icon)
+                Button(action: onToggleSelect) {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 13))
+                        .foregroundStyle(selected ? Theme.accent : (hovering ? Color.secondary : Color.secondary.opacity(0.6)))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(width: ProcessMonitorView.Col.check)
+                .help(selected ? "Deselect \(group.name)" : "Select \(group.name) for Quit Selected")
+                .accessibilityLabel(selected ? "Deselect \(group.name)" : "Select \(group.name) for quit selected")
+
+                Button(action: onToggleExpand) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 12)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(expanded ? "Hide this app's processes" : "Show this app's processes")
+                .accessibilityLabel(expanded ? "Collapse \(group.name)" : "Expand \(group.name)")
+
+                Image(nsImage: group.icon)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 16, height: 16)
                     .accessibilityHidden(true)
-                Text(row.name)
+                Text(group.name)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .strikethrough(row.killed, color: .secondary)
-                    .foregroundStyle(row.killed ? Color.secondary : Color.primary)
-                if row.isOwnApp {
+                    .strikethrough(group.killed, color: .secondary)
+                    .foregroundStyle(group.killed ? Color.secondary : Color.primary)
+                if group.procCount > 1 {
+                    Text("\(group.procCount) procs")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("\(group.procCount) processes")
+                }
+                if group.isOwnApp {
                     Text("this app")
                         .font(.caption2)
                         .padding(.horizontal, 5)
@@ -439,31 +695,93 @@ private struct ProcessRowView: View {
                         .background(Color.accentColor.opacity(0.16), in: Capsule())
                         .foregroundStyle(.secondary)
                         .help("This is Editor Workflow, the app you are using")
-                        .accessibilityLabel("This process is Editor Workflow, the app you are using")
+                        .accessibilityLabel("This is Editor Workflow, the app you are using")
                 }
                 Spacer(minLength: 8)
-                Text("\(row.pid)")
-                    .monospacedDigit()
-                    .frame(width: ProcessMonitorView.Col.pid, alignment: .trailing)
-                    .foregroundStyle(.secondary)
-                Text(String(format: "%.1f", row.cpu))
+                Text(String(format: "%.1f", group.cpu))
                     .monospacedDigit()
                     .frame(width: ProcessMonitorView.Col.cpu, alignment: .trailing)
-                Text(ProcessMonitorRow.memoryText(row.rssKB))
+                Text(ProcessMonitorRow.memoryText(group.rssKB))
                     .monospacedDigit()
                     .frame(width: ProcessMonitorView.Col.mem, alignment: .trailing)
-                ForceQuitButton(row: row, action: { forceQuit(row) })
+                GroupQuitButton(group: group, action: forceQuitGroup)
             }
             .font(.system(size: 12))
-            if let err = row.killError {
-                Text("Force quit failed: \(err)")
+            if let err = group.killError {
+                Text("Force quit failed for some processes: \(err)")
                     .font(.caption2)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 24)
-                    .accessibilityLabel("Force quit failed: \(err)")
+                    .padding(.leading, 34)
+                    .accessibilityLabel("Force quit failed for some processes: \(err)")
+            }
+            if expanded {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(members) { member in
+                        ProcessMemberRow(row: member, forceQuit: forceQuit)
+                            .padding(.leading, 34)
+                    }
+                }
+                .padding(.top, 3)
             }
         }
+        .onHover { hovering = $0 }
+    }
+}
+
+/// One process inside an expanded app group.
+private struct ProcessMemberRow: View {
+    let row: ProcessMonitorRow
+    let forceQuit: (ProcessMonitorRow) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(row.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .strikethrough(row.killed, color: .secondary)
+                .foregroundStyle(row.killed ? Color.secondary : Color.primary)
+            Spacer(minLength: 8)
+            Text("\(row.pid)")
+                .monospacedDigit()
+                .frame(width: ProcessMonitorView.Col.procs, alignment: .trailing)
+                .foregroundStyle(.secondary)
+            Text(String(format: "%.1f", row.cpu))
+                .monospacedDigit()
+                .frame(width: ProcessMonitorView.Col.cpu, alignment: .trailing)
+            Text(ProcessMonitorRow.memoryText(row.rssKB))
+                .monospacedDigit()
+                .frame(width: ProcessMonitorView.Col.mem, alignment: .trailing)
+            ForceQuitButton(row: row, action: { forceQuit(row) })
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("process \(row.name), pid \(row.pid), \(String(format: "%.1f", row.cpu)) percent CPU, \(ProcessMonitorRow.memoryText(row.rssKB))")
+    }
+}
+
+/// Quit control for a whole app group.
+private struct GroupQuitButton: View {
+    let group: ProcessAppGroup
+    let action: () -> Void
+    @Local private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: hovering ? "xmark.circle.fill" : "xmark.circle")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(hovering ? Color.red : Color.secondary)
+                .frame(width: 24, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(group.killed)
+        .opacity(group.killed ? 0.4 : 1)
+        .onHover { hovering = $0 }
+        .help("Force quit \(group.name) — all \(group.procCount) process(es); unsaved data will be lost")
+        .accessibilityLabel("Force quit \(group.name), \(group.procCount) processes")
     }
 }
 
@@ -504,8 +822,8 @@ final class ProcessMonitorController: NSObject {
             // A window must not size itself from its content: that fed a layout loop elsewhere in this app.
             host.sizingOptions = []
             let w = NSWindow(contentViewController: host)
-            w.setContentSize(NSSize(width: 640, height: 520))
-            w.minSize = NSSize(width: 520, height: 380)
+            w.setContentSize(NSSize(width: 680, height: 540))
+            w.minSize = NSSize(width: 560, height: 400)
             w.title = "Background Activity"
             w.styleMask = [.titled, .closable, .resizable, .miniaturizable]
             w.isReleasedWhenClosed = false

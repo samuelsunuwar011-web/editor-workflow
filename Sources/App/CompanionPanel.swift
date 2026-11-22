@@ -49,6 +49,8 @@ struct CompanionPanel: View {
                     case .create: CreateTemplatePage()
                     case .shelf: ShelfPage()
                     case .notes: ScratchpadPage()
+                    case .activity: ProcessMonitorView()
+                    case .cleaning: CleaningPage()
                     }
                 }
             }
@@ -56,7 +58,7 @@ struct CompanionPanel: View {
         }
         // Height follows the content: no empty band under short pages. One width for every tab, so switching tabs doesn't jump;
         // copying needs room for From and To side by side.
-        .frame(width: panel.expanded ? 920 : 720)
+        .frame(width: panel.expanded ? 960 : 800)
         .fixedSize(horizontal: false, vertical: true)
         .background(.background)
         .tint(Theme.accent)
@@ -69,6 +71,8 @@ struct CompanionPanel: View {
             tab(.create, "doc.badge.plus", "doc.fill.badge.plus", "Add Template")
             tab(.shelf, "photo.on.rectangle", "photo.on.rectangle.angled", "Shelf")
             tab(.notes, "note.text", "note.text", "Notes")
+            tab(.activity, "gauge.with.needle", "gauge.with.needle.fill", "Activity")
+            tab(.cleaning, "keyboard", "keyboard.fill", "Clean")
             Spacer()
             let jobs = model.activeJobs.count + model.queue.count
             if jobs > 0 || panel.showQueue {
