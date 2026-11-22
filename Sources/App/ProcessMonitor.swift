@@ -240,9 +240,11 @@ final class ProcessMonitorModel: ObservableObject {
     /// Bundle path when the executable lives inside a .app, else the executable path itself.
     static func appKey(_ command: String) -> (key: String, name: String) {
         if let r = command.range(of: ".app/"), r.upperBound < command.endIndex {
-            let bundle = String(command[..<r.upperBound])          // includes ".app/"
-            let path = String(bundle.dropLast())                   // strip trailing "/"
-            return (path, (path as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""))
+            let path = String(String(command[..<r.upperBound]).dropLast())   // ".app/" → strip the slash
+            let leaf = (path as NSString).lastPathComponent
+            // Strip the extension once — replacing every ".app" would mangle names like "App.app.app".
+            let name = leaf.hasSuffix(".app") ? String(leaf.dropLast(4)) : leaf
+            return (path, name)
         }
         if let r = command.range(of: "/Contents/") {
             let path = String(command[..<r.lowerBound])

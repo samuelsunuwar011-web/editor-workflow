@@ -63,6 +63,9 @@ struct LiveProgress: Equatable {
     var phase = "Preparing"
     var currentFile = ""
     var samples: [(Date, Int64)] = []
+    /// Files that started within the last moment: when several streams run at once the row
+    /// shows a count ("4 files at once") instead of flickering between file names.
+    var recentFiles: [(Date, String)] = []
     static func == (a: LiveProgress, b: LiveProgress) -> Bool { a.phase == b.phase && a.currentFile == b.currentFile && a.samples.count == b.samples.count }
     /// Rolling speed over the last ~5 seconds.
     var bytesPerSecond: Double? {
@@ -108,11 +111,15 @@ final class AppModel: ObservableObject {
     @Published var pendingTemplateDrop: URL?
 
     /// Photos → Shelf. .drp → Add Template. Folder or footage → New Project with that media.
+    /// Anything else is refused with a reason — never silently turned into a "project".
     func handleDropped(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         // Photos are the shelf's job — route them there no matter where they were dropped.
-        let images = urls.filter { AppModel.imageExts.contains($0.pathExtension.lowercased()) }
-        let rest = urls.filter { !AppModel.imageExts.contains($0.pathExtension.lowercased()) }
+        let isShelf: (URL) -> Bool = {
+            AppModel.imageExts.contains($0.pathExtension.lowercased()) || MediaCategory.of($0) == .photo
+        }
+        let images = urls.filter(isShelf)
+        let rest = urls.filter { !isShelf($0) }
         if !images.isEmpty {
             ScratchpadStore.shared.addShelf(urls: images)
             companion.tab = .shelf
@@ -125,9 +132,16 @@ final class AppModel: ObservableObject {
         if u.pathExtension.lowercased() == "drp" {
             pendingTemplateDrop = u
             companion.tab = .create
-        } else {
+            return
+        }
+        var isDir: ObjCBool = false
+        FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir)
+        let cat = MediaCategory.of(u)
+        if isDir.boolValue || cat == .video || cat == .raw || cat == .audio {
             companion.handoff = ProjectHandoff(mediaSource: u.path, projectName: u.deletingPathExtension().lastPathComponent)
             companion.tab = .favorites
+        } else {
+            errorMessage = "\"\(u.lastPathComponent)\" isn't footage. Photos go on the Shelf, a .drp on Add Template; a folder, video, audio or RAW file starts a project."
         }
     }
     static let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp", "ico", "avif"]
@@ -662,7 +676,16 @@ final class AppModel: ObservableObject {
             }, isCancelled: { flags[id] }, activity: { file, phase in
                 guard Date().timeIntervalSince(lastAct) > 0.1 || phase == "Verifying" else { return }
                 lastAct = Date()
-                Task { @MainActor in self?.live[id]?.phase = phase; self?.live[id]?.currentFile = file }
+                Task { @MainActor in
+                    guard let self, var l = self.live[id] else { return }
+                    let now = Date()
+                    l.recentFiles.append((now, file))
+                    l.recentFiles.removeAll { now.timeIntervalSince($0.0) > 0.8 }
+                    let active = Set(l.recentFiles.map(\.1))
+                    l.phase = phase
+                    l.currentFile = active.count > 1 ? "\(active.count) files at once" : file
+                    self.live[id] = l
+                }
             })
             Task { @MainActor in
                 guard let self else { return }

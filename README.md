@@ -52,6 +52,14 @@ For Studio automation, set Resolve > Preferences > System > General > **External
 - **Clean** tab: Keyboard Cleaning Mode from inside the panel — start/stop, live Esc ×5 unlock progress, and the permission notes. While active the full-screen shield still covers every display.
 - Panel widened to 800 (960 expanded) so the new tabs have room.
 
+## Bug fixes (0.12.2)
+- Drops that are not photos, `.drp` or footage (a `.txt`, `.zip`, …) are refused with an explanation instead of being opened as a bogus "New Project".
+- Image drags now work everywhere: the full-panel drop screen accepts image data (Photos, browser, screenshots), the drag toward the menu bar opens the drop screen for image-only drags, and a photo dropped straight on the menu bar icon is saved into the shelf folder first.
+- Shelf file names from providers are sanitized (`:` and `/` can no longer break the path).
+- The live transfer row counts files truthfully ("Copying — 12 of 40 files done") and shows "4 files at once" instead of flickering between file names while parallel streams run.
+- Activity: app-group names strip the `.app` suffix once (bundles like `App.app.app` keep their name).
+- New regression test: two jobs copying into the same drive at the same time, both verified, both outputs intact.
+
 ## Uninstall
 1. Double-click `Uninstall Editor Workflow.command` (it is installed in `/Applications` and also sits beside the package). Answer `y` to remove the app, login item, preferences and caches; answer `y` to the second question to delete the library too. Add `--purge` for a silent full removal: `./Uninstall\ Editor\ Workflow.command --yes --purge`.
 2. Or by hand: quit the app, delete `Editor Workflow.app` and `~/Library/LaunchAgents/app.editorworkflow.mac.plist`, then delete `~/Library/Application Support/EditorWorkflow/` (library, history, logs). Settings → "Delete App Records…" does the same from inside the app.

@@ -757,6 +757,28 @@ test("Many small files (2,000) copy and verify") {
     check(job.status == .verified && runner.items(job.id).count == 2000, "2000 verified (\(String(format: "%.1f", Date().timeIntervalSince(start))) s)")
 }
 
+test("Two jobs copy at the same time into one drive without clobbering") {
+    let (db, paths, root) = try freshEnv("parallel")
+    let a = root.appendingPathComponent("CardA"), b = root.appendingPathComponent("CardB")
+    for i in 0..<40 { write(a.appendingPathComponent("clips/a\(i).mov"), String(repeating: "A\(i) ", count: 400)) }
+    for i in 0..<40 { write(b.appendingPathComponent("clips/b\(i).mov"), String(repeating: "B\(i) ", count: 400)) }
+    let dest = root.appendingPathComponent("SSD"); try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+    let runner = TransferRunner(db: db, paths: paths)
+    let p1 = TransferPlanner.plan(name: "a", source: a, destinationRoot: dest, mode: .cameraCardBackup, filter: nil, policy: .keepBoth)
+    let p2 = TransferPlanner.plan(name: "b", source: b, destinationRoot: dest, mode: .cameraCardBackup, filter: nil, policy: .keepBoth)
+    try runner.saveNew(p1); try runner.saveNew(p2)
+    var results = [TransferJob?](repeating: nil, count: 2)
+    DispatchQueue.concurrentPerform(iterations: 2) { i in
+        results[i] = runner.run(i == 0 ? p1.job : p2.job)
+    }
+    let (j1, j2) = (results[0]!, results[1]!)
+    check(j1.status == .verified && j2.status == .verified, "both verified in parallel: \(j1.status) \(j2.status)")
+    check(runner.items(j1.id).allSatisfy { $0.state == .verified } && runner.items(j2.id).allSatisfy { $0.state == .verified }, "every file verified in both jobs")
+    check(FileManager.default.fileExists(atPath: dest.appendingPathComponent("CardA/clips/a0.mov").path)
+            && FileManager.default.fileExists(atPath: dest.appendingPathComponent("CardB/clips/b0.mov").path),
+          "both outputs landed side by side on one drive")
+}
+
 if ProcessInfo.processInfo.environment["EW_BIG"] == "1" {
     test("Large file (>4 GiB) copies and verifies") {
         let (db, paths, root) = try freshEnv("big")

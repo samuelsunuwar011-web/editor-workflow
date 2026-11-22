@@ -493,7 +493,7 @@ struct TransferPage: View {
             // Fixed layout and height: lines never appear or vanish while copying, so the panel stays still.
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text(paused ? "Waiting to copy" : "Copying \(min(files + 1, totalFiles)) of \(totalFiles) files").font(.title3.weight(.semibold))
+                    Text(paused ? "Waiting to copy" : "Copying — \(files) of \(totalFiles) files done").font(.title3.weight(.semibold))
                     Spacer()
                     Text(frac >= 0.001 || done == 0 ? "\(Int(frac * 100))%" : "<1%").font(Theme.number(20))
                 }
@@ -1356,14 +1356,14 @@ struct DropScreen: View {
     @ObservedObject var panel: PanelState
     @Local private var over = false
 
-    // One target: the app decides from the file itself (.drp makes a template, anything else starts a project).
+    // One target: photos go to the Shelf, a .drp makes a template, footage starts a project.
     var body: some View {
-        zone("arrow.down.doc", "Drop it here", "A .drp becomes a template. Footage starts a project.", $over) { $0 }
+        zone("arrow.down.doc", "Drop it here", "Photos go to the Shelf. A .drp becomes a template. Footage starts a project.", $over)
             .frame(height: 240)
             .padding(.top, 6)
     }
 
-    func zone(_ icon: String, _ title: String, _ subtitle: String, _ over: Binding<Bool>, pick: @escaping ([URL]) -> [URL]) -> some View {
+    func zone(_ icon: String, _ title: String, _ subtitle: String, _ over: Binding<Bool>) -> some View {
         RoundedRectangle(cornerRadius: 16)
             .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
             .foregroundStyle(over.wrappedValue ? Theme.accent : Color.secondary.opacity(0.5))
@@ -1377,21 +1377,12 @@ struct DropScreen: View {
             }
             .scaleEffect(over.wrappedValue && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 1.02 : 1)
             .animation(.easeOut(duration: 0.15), value: over.wrappedValue)
-            .onDrop(of: [.fileURL], isTargeted: over) { providers in
-                let group = DispatchGroup()
-                let lock = NSLock()
-                nonisolated(unsafe) var urls: [URL] = []
-                for p in providers {
-                    group.enter()
-                    _ = p.loadObject(ofClass: URL.self) { u, _ in
-                        if let u { lock.lock(); urls.append(u); lock.unlock() }
-                        group.leave()
-                    }
-                }
-                group.notify(queue: .main) {
-                    let chosen = pick(urls).isEmpty ? urls : pick(urls)   // dropped on the "wrong" zone: still do the sensible thing
+            .onDrop(of: [.fileURL, .image], isTargeted: over) { providers in
+                // File drops give URLs directly; image data (Photos, browser, screenshots) is
+                // written into the shelf folder first, so both kinds land somewhere real.
+                ShelfIngest.run(providers) { urls in
                     panel.dropMode = false
-                    model.handleDropped(chosen)
+                    model.handleDropped(urls)
                 }
                 return true
             }

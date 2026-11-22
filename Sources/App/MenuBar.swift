@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import ServiceManagement
+import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
 
 /// Owns the status item and the companion popover. AppKit is used so a drive event can open the panel programmatically,
@@ -156,13 +157,15 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
         } as Any)
     }
 
-    /// Only file drags of a .drp, a folder or media, and only near the top of the screen (on the way to the icon).
+    /// Only file drags of a .drp, a folder or media — or a bare image (Photos, browser, screenshot)
+    /// with no file behind it — and only near the top of the screen (on the way to the icon).
     private func dragMoved() {
         let pb = NSPasteboard(name: .drag)
         if pb.changeCount != lastDragCount {
             lastDragCount = pb.changeCount
             let urls = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-            dragIsCandidate = urls.contains { u in
+            let hasImage = (pb.types ?? []).contains { UTType($0.rawValue)?.conforms(to: .image) ?? false }
+            dragIsCandidate = hasImage || urls.contains { u in
                 var d: ObjCBool = false
                 FileManager.default.fileExists(atPath: u.path, isDirectory: &d)
                 if d.boolValue || u.pathExtension.lowercased() == "drp" { return true }
@@ -387,7 +390,11 @@ final class StatusDropView: NSView {
     var onDrop: ([URL]) -> Void = { _ in }
     var onEnter: () -> Void = {}
 
-    override init(frame: NSRect) { super.init(frame: frame); registerForDraggedTypes([.fileURL]) }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        // .image covers photo drags that carry data instead of a file URL (Photos, browser).
+        registerForDraggedTypes([.fileURL, .tiff, .png, NSPasteboard.PasteboardType("public.image")])
+    }
     required init?(coder: NSCoder) { nil }
 
     override func mouseDown(with event: NSEvent) { onHighlight(true) }
@@ -399,9 +406,18 @@ final class StatusDropView: NSView {
     override func draggingExited(_ sender: NSDraggingInfo?) { onHighlight(false) }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         onHighlight(false)
-        let urls = (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-        guard !urls.isEmpty else { return false }
-        DispatchQueue.main.async { self.onDrop(urls) }
-        return true
+        let pb = sender.draggingPasteboard
+        let urls = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        if !urls.isEmpty {
+            DispatchQueue.main.async { self.onDrop(urls) }
+            return true
+        }
+        // Image data with no file behind it: save it into the shelf folder, then treat it as a drop.
+        if let img = NSImage(pasteboard: pb), let tiff = img.tiffRepresentation,
+           let url = ShelfIngest.saveImage(tiff, suggested: nil) {
+            DispatchQueue.main.async { self.onDrop([url]) }
+            return true
+        }
+        return false
     }
 }

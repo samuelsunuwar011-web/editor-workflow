@@ -210,8 +210,13 @@ enum ShelfIngest {
 
     private static func save(_ data: Data, suggested: String?) -> URL? {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Providers may hand over names with ":" or "/" (timestamps, browser titles): both would
+        // break the path, so they become "-".
         let raw = (suggested ?? "").trimmingCharacters(in: .whitespaces)
-        let base = raw.isEmpty ? "Image \(ISO8601DateFormatter().string(from: Date()))" : (raw as NSString).deletingPathExtension
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let base = raw.isEmpty ? "Image \(stamp)" : (raw as NSString).deletingPathExtension
         let ext = extensionFor(suggested: raw, data: data)
         var url = dir.appendingPathComponent("\(base).\(ext)")
         var n = 2
@@ -220,6 +225,9 @@ enum ShelfIngest {
         }
         return (try? data.write(to: url, options: .atomic)) != nil ? url : nil
     }
+
+    /// Saves raw image bytes (a drag that carried data, not a file) into the shelf folder.
+    static func saveImage(_ data: Data, suggested: String?) -> URL? { save(data, suggested: suggested) }
 
     private static func extensionFor(suggested: String, data: Data) -> String {
         let fromName = (suggested as NSString).pathExtension.lowercased()
