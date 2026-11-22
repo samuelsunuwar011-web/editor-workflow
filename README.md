@@ -48,7 +48,7 @@ For Studio automation, set Resolve > Preferences > System > General > **External
 
 ## Panel tabs (0.11)
 - **Shelf** is photos-only: dropping images (Finder, Photos app, screenshots — file or raw image data) stores them as thumbnails on the shelf. Double-click a photo to reveal it in Finder; right-click for Open / Reveal / Start Project / Remove. Dropping a `.drp` still routes to Add Template, footage still routes to New Project.
-- **Activity** tab: the process monitor inside the panel, grouped by app — one row per app with its icon, aggregated CPU and memory, and a "Using most:" line naming the top CPU consumers. Expand a row to see its individual processes; tick rows (or all) and use **Quit Selected** or **Quit All** (both ask first; this app and system processes are skipped by Quit All).
+- **Activity** tab: the process monitor inside the panel, grouped by app — one row per app with its icon, aggregated CPU and memory, and a "Using most:" line naming the top CPU consumers. Expand a row to see its individual processes; tick rows (or all) and use **Quit Selected** or **Quit All** (both ask first; this app and system processes are skipped by Quit All). Built for smooth live refresh: icons are cached for the app's lifetime, the filtered/sorted list is computed once per refresh instead of per frame, and the toolbar is a single compact row (RAM pressure moved into the summary line).
 - **Clean** tab: Keyboard Cleaning Mode from inside the panel — start/stop, live Esc ×5 unlock progress, and the permission notes. While active the full-screen shield still covers every display.
 - Panel widened to 800 (960 expanded) so the new tabs have room.
 

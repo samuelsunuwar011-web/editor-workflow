@@ -59,16 +59,19 @@ struct ProcessAppGroup: Identifiable {
     /// Sum of the members' ps CPU (multi-core apps exceed 100).
     let cpu: Double
     let rssKB: Int64
-    /// Member pids, ascending — the quit order.
-    let pids: [Int32]
+    /// Member rows, pid-ascending — what an expanded group shows.
+    let members: [ProcessMonitorRow]
     let isOwnApp: Bool
     /// Every member is marked killed.
     let killed: Bool
     /// First failed-quit error, if any member refused to die.
     let killError: String?
+    /// name + member pids + commands, lowercased: one substring test per search keystroke.
+    let searchText: String
 
     var id: String { key }
-    var procCount: Int { pids.count }
+    var procCount: Int { members.count }
+    var pids: [Int32] { members.map(\.pid) }
 }
 
 /// Sort columns; the header cycles ascending/descending for the clicked one.
@@ -90,11 +93,17 @@ final class ProcessMonitorModel: ObservableObject {
     @Published private(set) var groups: [ProcessAppGroup] = []
     @Published private(set) var sortKey: ProcessMonitorSort = .memory
     @Published private(set) var sortAscending = false
-    @Published var search = ""
+    /// Filtered + sorted groups, computed once per refresh / keystroke — not per render.
+    @Published private(set) var displayed: [ProcessAppGroup] = []
+    /// Member rows of the expanded groups, filtered with the same search.
+    @Published private(set) var displayedMembers: [String: [ProcessMonitorRow]] = [:]
+    /// Heaviest apps right now ("using most").
+    @Published private(set) var topConsumers: [ProcessAppGroup] = []
+    @Published var search = "" { didSet { recompute() } }
     /// App-group keys ticked for "Quit Selected".
     @Published var selection: Set<String> = []
     /// App-groups expanded to show their individual processes.
-    @Published var expanded: Set<String> = []
+    @Published var expanded: Set<String> = [] { didSet { recompute() } }
     @Published private(set) var rssTotalKB: Int64 = 0
     @Published private(set) var cpuTotal: Double = 0
     @Published private(set) var psError: String?
@@ -102,7 +111,10 @@ final class ProcessMonitorModel: ObservableObject {
     /// 2 s refresh on the main run loop in `.common`, so scrolling or a menu doesn't pause it.
     let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
-    private var icons: [String: NSImage] = [:]
+    /// Icon lookups hit the disk; they are keyed by path and never re-fetched (static: they survive
+    /// closing and reopening the panel, so switching tabs does not reload hundreds of icons).
+    private static var icons: [String: NSImage] = [:]
+    private static var groupIcons: [String: NSImage] = [:]
     /// Per-pid Force Quit outcome, merged into every refresh until the pid disappears.
     private var states: [Int32: RowState] = [:]
 
@@ -143,7 +155,8 @@ final class ProcessMonitorModel: ObservableObject {
         // Drop ticks and expansions for apps that just vanished.
         let aliveKeys = Set(groups.map(\.key))
         selection = selection.intersection(aliveKeys)
-        expanded = expanded.intersection(aliveKeys)
+        expanded.formIntersection(aliveKeys)
+        recompute()
         psError = nil
     }
 
@@ -190,13 +203,13 @@ final class ProcessMonitorModel: ObservableObject {
     }
 
     /// Groups ps rows into apps: anything under a .app (or under .../Contents/) belongs to that bundle;
-    /// loose binaries each form their own group.
+    /// loose binaries each form their own group. Built once per refresh, never per render.
     static func aggregate(_ rows: [ProcessMonitorRow]) -> [ProcessAppGroup] {
         struct Acc {
             var name = ""
             var cpu = 0.0
             var rssKB: Int64 = 0
-            var pids: [Int32] = []
+            var members: [ProcessMonitorRow] = []
             var own = false
             var killed = true
             var error: String?
@@ -209,16 +222,18 @@ final class ProcessMonitorModel: ObservableObject {
             if g.name.isEmpty { g.name = name; g.sample = row.command }
             g.cpu += row.cpu
             g.rssKB += row.rssKB
-            g.pids.append(row.pid)
+            g.members.append(row)
             g.own = g.own || row.isOwnApp
             g.killed = g.killed && row.killed
             if let e = row.killError, g.error == nil { g.error = e }
             byKey[key] = g
         }
         return byKey.map { key, g in
-            ProcessAppGroup(key: key, name: g.name, icon: iconForGroup(g.sample),
-                            cpu: g.cpu, rssKB: g.rssKB, pids: g.pids.sorted(), isOwnApp: g.own,
-                            killed: g.killed, killError: g.error)
+            let members = g.members.sorted { $0.pid < $1.pid }
+            let text = (g.name + " " + members.map { "\($0.pid) \($0.command)" }.joined(separator: " ")).lowercased()
+            return ProcessAppGroup(key: key, name: g.name, icon: iconForGroup(g.sample),
+                                   cpu: g.cpu, rssKB: g.rssKB, members: members, isOwnApp: g.own,
+                                   killed: g.killed, killError: g.error, searchText: text)
         }
     }
 
@@ -238,35 +253,37 @@ final class ProcessMonitorModel: ObservableObject {
     }
 
     private static func iconForGroup(_ command: String) -> NSImage {
-        if command.hasPrefix("/") {
-            return NSWorkspace.shared.icon(forFile: command)
-        }
-        return ProcessMonitorRow.genericIcon
+        if let cached = groupIcons[command] { return cached }
+        let img = command.hasPrefix("/") ? NSWorkspace.shared.icon(forFile: command) : ProcessMonitorRow.genericIcon
+        groupIcons[command] = img
+        return img
     }
 
     private func icon(for command: String) -> NSImage {
-        if let cached = icons[command] { return cached }
+        if let cached = Self.icons[command] { return cached }
         // Only absolute paths have a real icon; anything else gets the generic app glyph.
         let img = command.hasPrefix("/")
             ? NSWorkspace.shared.icon(forFile: command)
             : ProcessMonitorRow.genericIcon
-        icons[command] = img
+        Self.icons[command] = img
         return img
     }
 
     // MARK: Sorting and filtering
 
-    /// Groups after search + sort — what the list renders.
-    var visibleGroups: [ProcessAppGroup] {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        var list = groups
-        if !q.isEmpty {
-            list = list.filter { g in
-                g.name.localizedCaseInsensitiveContains(q)
-                    || g.pids.contains { String($0).contains(q) }
-                    || rows.contains { $0.command.contains(q) && Self.appKey($0.command).key == g.key }
-            }
-        }
+    /// Groups after search + sort — what the list renders. Stored, not recomputed per render.
+    var visibleGroups: [ProcessAppGroup] { displayed }
+
+    /// Members of one expanded group (pre-filtered in `recompute`).
+    func visibleMembers(of group: ProcessAppGroup) -> [ProcessMonitorRow] {
+        displayedMembers[group.key] ?? []
+    }
+
+    /// Rebuilds `displayed`, `displayedMembers` and `topConsumers` from the current
+    /// groups + search + sort. Runs on refresh, keystroke, sort click and expand — never per render.
+    private func recompute() {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var list = q.isEmpty ? groups : groups.filter { $0.searchText.contains(q) }
         let key = sortKey
         list.sort { a, b in
             switch key {
@@ -276,23 +293,22 @@ final class ProcessMonitorModel: ObservableObject {
             case .memory: return a.rssKB < b.rssKB
             }
         }
+        // Ties keep a stable key order so the list doesn't shuffle between refreshes.
         if !sortAscending { list.reverse() }
-        return list
-    }
-
-    /// Members of one expanded group, filtered by the same search, in pid order.
-    func visibleMembers(of group: ProcessAppGroup) -> [ProcessMonitorRow] {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        return rows.filter { row in
-            guard group.pids.contains(row.pid) else { return false }
-            if q.isEmpty { return true }
-            return row.name.localizedCaseInsensitiveContains(q) || String(row.pid).contains(q) || row.command.localizedCaseInsensitiveContains(q)
+        displayed = list
+        var members: [String: [ProcessMonitorRow]] = [:]
+        for g in list where expanded.contains(g.key) {
+            members[g.key] = q.isEmpty
+                ? g.members
+                : g.members.filter { $0.name.lowercased().contains(q) || String($0.pid).contains(q) || $0.command.lowercased().contains(q) }
         }
-        .sorted { $0.pid < $1.pid }
+        displayedMembers = members
+        topConsumers = groups.sorted { $0.cpu > $1.cpu }.prefix(3).filter { $0.cpu >= 1 }.map { $0 }
     }
 
     func setSort(_ key: ProcessMonitorSort) {
         if sortKey == key { sortAscending.toggle() } else { sortKey = key; sortAscending = true }
+        recompute()
     }
 
     func toggleSelect(_ group: ProcessAppGroup) {
@@ -326,11 +342,6 @@ final class ProcessMonitorModel: ObservableObject {
     }
 
     var overMemoryBudget: Bool { Double(rssTotalKB) * 1024 > 0.7 * Double(ProcessInfo.processInfo.physicalMemory) }
-
-    /// The heaviest apps right now — "show me what's using the most".
-    var topConsumers: [ProcessAppGroup] {
-        groups.sorted { $0.cpu > $1.cpu }.prefix(3).filter { $0.cpu >= 1 }.map { $0 }
-    }
 
     // MARK: Force Quit
 
@@ -428,10 +439,12 @@ struct ProcessMonitorView: View {
 
     private var toolbar: some View {
         HStack(spacing: 10) {
-            Button { model.refresh() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
-                .buttonStyle(.bordered)
-                .help("Refresh the process list now")
-                .accessibilityLabel("Refresh process list")
+            Button { model.refresh() } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .help("Refresh the process list now")
+            .accessibilityLabel("Refresh process list")
 
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
@@ -440,7 +453,7 @@ struct ProcessMonitorView: View {
                     .accessibilityLabel("Search apps or processes by name or PID")
             }
             .padding(.horizontal, 8)
-            .frame(width: 170, height: 28)
+            .frame(width: 150, height: 28)
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             .help("Filter by name or PID")
 
@@ -465,21 +478,6 @@ struct ProcessMonitorView: View {
             .tint(.red)
             .help("Force quit every visible app except this one and system processes")
             .accessibilityLabel("Quit all visible apps")
-
-            VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: model.pressure, total: 1)
-                    .progressViewStyle(.linear)
-                    .frame(width: 130)
-                    // Memory pressure colours: green, then orange, red past 80 %.
-                    .tint(model.pressure > 0.8 ? .red : model.pressure > 0.6 ? .orange : .green)
-                    .accessibilityLabel("Memory pressure")
-                    .accessibilityValue(Text("\(Int(model.pressure * 100)) percent"))
-                    .help("Memory in use as a share of physical memory")
-                Text("RAM \(ProcessMonitorRow.memoryText(model.rssTotalKB)) of \(ProcessMonitorRow.memoryText(model.physicalKB))")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Memory in use \(ProcessMonitorRow.memoryText(model.rssTotalKB)) of \(ProcessMonitorRow.memoryText(model.physicalKB))")
-            }
         }
     }
 
@@ -494,6 +492,20 @@ struct ProcessMonitorView: View {
                 Spacer(minLength: 8)
                 if let err = model.psError {
                     Text(err).font(.caption).foregroundStyle(.red)
+                }
+                VStack(alignment: .trailing, spacing: 2) {
+                    ProgressView(value: model.pressure, total: 1)
+                        .progressViewStyle(.linear)
+                        .frame(width: 110)
+                        // Memory pressure colours: green, then orange, red past 80 %.
+                        .tint(model.pressure > 0.8 ? .red : model.pressure > 0.6 ? .orange : .green)
+                        .accessibilityLabel("Memory pressure")
+                        .accessibilityValue(Text("\(Int(model.pressure * 100)) percent"))
+                        .help("Memory in use as a share of physical memory")
+                    Text("RAM \(ProcessMonitorRow.memoryText(model.rssTotalKB)) of \(ProcessMonitorRow.memoryText(model.physicalKB))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Memory in use \(ProcessMonitorRow.memoryText(model.rssTotalKB)) of \(ProcessMonitorRow.memoryText(model.physicalKB))")
                 }
             }
             .font(.callout)
@@ -588,7 +600,7 @@ struct ProcessMonitorView: View {
                             group: group,
                             selected: model.selection.contains(group.key),
                             expanded: model.expanded.contains(group.key),
-                            members: model.expanded.contains(group.key) ? model.visibleMembers(of: group) : [],
+                            members: model.visibleMembers(of: group),
                             onToggleSelect: { model.toggleSelect(group) },
                             onToggleExpand: { model.toggleExpand(group) },
                             forceQuit: { model.forceQuit($0) },
