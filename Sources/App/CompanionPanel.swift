@@ -47,6 +47,8 @@ struct CompanionPanel: View {
                     case .transfer: TransferPage(panel: panel)
                     case .favorites: FavoritesPage()
                     case .create: CreateTemplatePage()
+                    case .shelf: ShelfPage()
+                    case .notes: ScratchpadPage()
                     }
                 }
             }
@@ -65,6 +67,8 @@ struct CompanionPanel: View {
             tab(.transfer, "square.and.arrow.down.on.square", "square.and.arrow.down.on.square.fill", "Copy")
             tab(.favorites, "film.stack", "film.stack.fill", "New Project")
             tab(.create, "doc.badge.plus", "doc.fill.badge.plus", "Add Template")
+            tab(.shelf, "photo.on.rectangle", "photo.on.rectangle.angled", "Shelf")
+            tab(.notes, "note.text", "note.text", "Notes")
             Spacer()
             let jobs = model.activeJobs.count + model.queue.count
             if jobs > 0 || panel.showQueue {

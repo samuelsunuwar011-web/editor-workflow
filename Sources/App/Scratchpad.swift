@@ -162,6 +162,191 @@ final class ScratchpadStore: ObservableObject {
     }
 }
 
+// MARK: Shelf tab — the photo/file shelf, with smart drop routing
+
+/// Top-level Shelf tab. Photos drop straight onto the shelf as thumbnails;
+/// a .drp routes to Add Template (it becomes a template), a folder or footage
+/// file routes to New Project with that media preselected.
+struct ShelfPage: View {
+    @EnvironmentObject var model: AppModel
+    @ObservedObject private var store = ScratchpadStore.shared
+    @Local private var dropTargeted = false
+    @Local private var confirmRemove: ShelfItem?
+
+    private static let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp", "ico", "avif"]
+    private static let videoExts: Set<String> = ["mov", "mp4", "m4v", "avi", "mkv", "mxf", "mts", "m2ts", "insv"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Shelf", systemImage: "photo.on.rectangle").font(.headline)
+                Text("\(store.doc.shelf.count) item(s)").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text("Drop photos here · .drp makes a template · footage starts a project")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+            if store.doc.shelf.isEmpty {
+                empty
+            } else {
+                grid
+            }
+        }
+        .padding(.vertical, 4)
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            let lock = NSLock()
+            var urls: [URL] = []
+            let group = DispatchGroup()
+            for p in providers {
+                group.enter()
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { lock.lock(); urls.append(url); lock.unlock() }
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { route(urls) }
+            return true
+        }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    .foregroundStyle(Theme.accent)
+                    .padding(4)
+            }
+        }
+    }
+
+    /// Photos → shelf. One .drp or one footage item → its own page. Never silently multi-route.
+    private func route(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let images = urls.filter { Self.imageExts.contains($0.pathExtension.lowercased()) }
+        let rest = urls.filter { !Self.imageExts.contains($0.pathExtension.lowercased()) }
+        if !images.isEmpty { store.addShelf(urls: images) }
+        if rest.isEmpty { return }
+        if rest.count == 1 { model.handleDropped(rest) }
+        else { model.errorMessage = "Drop one .drp or one footage folder at a time — photos all go to the Shelf." }
+    }
+
+    private var empty: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "photo.on.rectangle.angled").font(.system(size: 34)).foregroundStyle(.tertiary)
+            Text("Drop anything here").font(.callout.weight(.medium))
+            Text("Photos and images become thumbnails on this shelf.\nA .drp becomes a template. A folder or video opens New Project with that footage.")
+                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 34)
+        .background(dropTargeted ? Theme.accent.opacity(0.08) : Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var grid: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96, maximum: 140), spacing: 10)], spacing: 10) {
+                ForEach(store.doc.shelf) { item in
+                    ShelfCard(item: item) {
+                        confirmRemove = item
+                    }
+                }
+            }
+            .padding(4)
+        }
+        .frame(maxHeight: 360)
+        .confirmationDialog("Remove \"\(confirmRemove?.name ?? "")\" from the shelf?", isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } })) {
+            Button("Remove from Shelf", role: .destructive) {
+                if let i = confirmRemove { store.removeShelf(i.id) }
+                confirmRemove = nil
+            }
+            Button("Cancel", role: .cancel) { confirmRemove = nil }
+        } message: {
+            Text("The file itself is not deleted.")
+        }
+    }
+}
+
+/// One shelf card: thumbnail, name, remove button.
+struct ShelfCard: View {
+    @EnvironmentObject var model: AppModel
+    let item: ShelfItem
+    let onRemove: () -> Void
+
+    static let videoExts: Set<String> = ["mov", "mp4", "m4v", "avi", "mkv", "mxf", "mts", "m2ts", "insv"]
+    static let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp", "ico", "avif"]
+
+    var body: some View {
+        let url = URL(fileURLWithPath: item.path)
+        let ext = url.pathExtension.lowercased()
+        VStack(spacing: 4) {
+            ZStack(alignment: .topTrailing) {
+                thumb(ext: ext, url: url)
+                Button(action: onRemove) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 13))
+                        .background(Circle().fill(.ultraThinMaterial))
+                }
+                .buttonStyle(.plain)
+                .padding(3)
+                .accessibilityLabel("Remove \(item.name) from shelf")
+            }
+            Text(item.name).font(.caption2).lineLimit(2).multilineTextAlignment(.center)
+        }
+        .padding(6)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .contextMenu {
+            Button("Open") { NSWorkspace.shared.open(url) }
+            Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            Button("Start Project with This") { model.handleDropped([url]) }
+            Divider()
+            Button("Remove from Shelf", role: .destructive, action: onRemove)
+        }
+        .help("\(item.name) — drop photos to add, right click for actions")
+    }
+
+    @ViewBuilder private func thumb(ext: String, url: URL) -> some View {
+        let exists = FileManager.default.fileExists(atPath: item.path)
+        Group {
+            if !exists {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.15))
+                    Image(systemName: "questionmark").foregroundStyle(.secondary)
+                }
+                .frame(height: 72)
+            } else if Self.imageExts.contains(ext), let img = NSImage(contentsOfFile: item.path) {
+                Image(nsImage: img).resizable().scaledToFill()
+                    .frame(height: 72).frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else if Self.videoExts.contains(ext) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8).fill(.black)
+                    VStack(spacing: 3) {
+                        Image(systemName: "play.circle.fill").foregroundStyle(.white).font(.title2)
+                        Text(ext.uppercased()).font(.caption2).foregroundStyle(.white.opacity(0.8))
+                    }
+                }
+                .frame(height: 72)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.12))
+                    VStack(spacing: 4) {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: item.path)).resizable().frame(width: 36, height: 36)
+                        Text(ext.uppercased()).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(height: 72)
+            }
+        }
+        .opacity(exists ? 1 : 0.5)
+    }
+}
+
+// MARK: Notes tab
+
+/// The scratchpad as a panel tab (the ⋯ menu still opens it as its own window too).
+struct ScratchpadPage: View {
+    var body: some View {
+        ScratchpadView()
+    }
+}
+
 // MARK: Controller
 
 @MainActor
@@ -202,7 +387,7 @@ struct ScratchpadView: View {
             Divider()
             editor
             Divider()
-            shelf
+            footer
         }
         .frame(minWidth: 380, minHeight: 280)
     }
@@ -277,99 +462,17 @@ struct ScratchpadView: View {
         Binding(get: { store.selected?.text ?? "" }, set: { store.setText($0) })
     }
 
-    // MARK: Shelf of dragged-in files and photos
+    // MARK: Footer — pad count and save state (files/photos live on the Shelf tab)
 
-    private static let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp"]
-    private static let videoExts: Set<String> = ["mov", "mp4", "m4v", "avi", "mkv", "mxf"]
-
-    private var shelf: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Label("Shelf", systemImage: "photo.on.rectangle").font(.caption).foregroundStyle(.secondary)
-                Text("drop files or photos here").font(.caption2).foregroundStyle(.tertiary)
-                Spacer()
-                Text("\(store.doc.pads.count) / 12 notes · \(store.saveState)")
-                    .font(.caption2)
-                    .foregroundStyle(store.saveState == "Saved" ? .secondary : (store.saveState.hasPrefix("Save failed") ? Color.red : .orange))
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    if store.doc.shelf.isEmpty {
-                        Text("Files you drop appear here as thumbnails.").font(.caption2).foregroundStyle(.tertiary)
-                    }
-                    ForEach(store.doc.shelf) { item in
-                        ShelfTile(item: item) {
-                            store.removeShelf(item.id)
-                        }
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-            .frame(height: 86)
+    private var footer: some View {
+        HStack {
+            Text("\(store.doc.pads.count) / 12 notes").font(.caption2).foregroundStyle(.secondary)
+            Spacer()
+            Text(store.saveState)
+                .font(.caption2)
+                .foregroundStyle(store.saveState == "Saved" ? .secondary : (store.saveState.hasPrefix("Save failed") ? Color.red : .orange))
         }
-        .padding(8)
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            var got = 0
-            for p in providers {
-                _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    guard let url else { return }
-                    got += 1
-                    Task { @MainActor in
-                        store.addShelf(urls: [url])
-                    }
-                }
-            }
-            return true
-        }
+        .padding(.horizontal, 10).padding(.vertical, 5)
     }
 }
 
-/// One shelf tile: image thumbnail, video frame-less film tile, or the system file icon.
-struct ShelfTile: View {
-    let item: ShelfItem
-    let onRemove: () -> Void
-
-    private static let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp"]
-    private static let videoExts: Set<String> = ["mov", "mp4", "m4v", "avi", "mkv", "mxf"]
-
-    var body: some View {
-        VStack(spacing: 3) {
-            thumb
-            Text(item.name).font(.caption2).lineLimit(1).truncationMode(.middle).frame(width: 64)
-        }
-        .contextMenu {
-            Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: item.path)) }
-            Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)]) }
-            Divider()
-            Button("Remove from Shelf", role: .destructive) { onRemove() }
-        }
-        .help("\(item.name) — right click to open or remove")
-    }
-
-    @ViewBuilder private var thumb: some View {
-        let url = URL(fileURLWithPath: item.path)
-        let ext = url.pathExtension.lowercased()
-        let exists = FileManager.default.fileExists(atPath: item.path)
-        Group {
-            if !exists {
-                Image(systemName: "questionmark").frame(width: 56, height: 56)
-                    .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
-                    .foregroundStyle(.secondary)
-            } else if Self.imageExts.contains(ext), let img = NSImage(contentsOfFile: item.path) {
-                Image(nsImage: img).resizable().scaledToFill()
-                    .frame(width: 56, height: 56)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else if Self.videoExts.contains(ext) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.85))
-                    Image(systemName: "film").foregroundStyle(.white).font(.title3)
-                }
-                .frame(width: 56, height: 56)
-            } else {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: item.path))
-                    .resizable().frame(width: 48, height: 48)
-            }
-        }
-        .opacity(exists ? 1 : 0.5)
-    }
-}
